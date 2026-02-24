@@ -12,6 +12,7 @@ function save()
     editor.save()
 end
 
+
 editor.set_keymap("C-z", "undo")
 editor.set_keymap("C-y", "redo")
 editor.set_keymap("C-s", "save")
