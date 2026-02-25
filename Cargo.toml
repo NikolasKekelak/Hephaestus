@@ -1,8 +1,12 @@
 [package]
-name = "Hephaestus"
+name = "heph"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 crossterm = "0.28"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+home = "0.5"

@@ -119,11 +119,62 @@ impl Editor {
         })?;
         editor_api.set("quit", lua_quit)?;
 
+        let state_clone = self.state.clone();
+        let project_api = self.lua.create_table()?;
+        
+        let s_clone = state_clone.clone();
+        project_api.set("get_root", self.lua.create_function(move |_, (): ()| {
+            let s = s_clone.lock().unwrap();
+            Ok(s.project.as_ref().map(|p| p.root.to_str().unwrap_or("").to_string()))
+        })?)?;
+
+        let s_clone = state_clone.clone();
+        project_api.set("get_name", self.lua.create_function(move |_, (): ()| {
+            let s = s_clone.lock().unwrap();
+            Ok(s.project.as_ref().map(|p| p.name.clone()))
+        })?)?;
+
+        let explorer_api = self.lua.create_table()?;
+        let s_clone = state_clone.clone();
+        explorer_api.set("toggle", self.lua.create_function(move |_, (): ()| {
+            let mut s = s_clone.lock().unwrap();
+            s.is_explorer_visible = !s.is_explorer_visible;
+            if s.is_explorer_visible {
+                s.focus_on_explorer = true;
+                Editor::sync_explorer_selection(&mut s);
+            } else {
+                s.focus_on_explorer = false;
+            }
+            Ok(())
+        })?)?;
+
+        let s_clone = state_clone.clone();
+        explorer_api.set("focus", self.lua.create_function(move |_, (): ()| {
+            let mut s = s_clone.lock().unwrap();
+            s.focus_on_explorer = !s.focus_on_explorer;
+            if s.focus_on_explorer {
+                s.is_explorer_visible = true;
+                Editor::sync_explorer_selection(&mut s);
+            }
+            Ok(())
+        })?)?;
+
+        let s_clone = state_clone.clone();
+        editor_api.set("get_recent_files", self.lua.create_function(move |_, (): ()| {
+            let s = s_clone.lock().unwrap();
+            let recent: Vec<String> = s.recent_files.iter()
+                .map(|p| p.to_str().unwrap_or("").to_string())
+                .collect();
+            Ok(recent)
+        })?)?;
+
+        project_api.set("explorer", explorer_api)?;
+        editor_api.set("project", project_api)?;
+
         globals.set("editor", editor_api)?;
 
-        // Load init.lua if it exists
-        if let Ok(content) = fs::read_to_string("init.lua") {
-            self.lua.load(&content).exec()?;
+        if fs::metadata("init.lua").is_ok() {
+            self.lua.load(fs::read_to_string("init.lua")?).exec()?;
         }
 
         Ok(())

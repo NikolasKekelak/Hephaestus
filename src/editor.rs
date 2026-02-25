@@ -4,6 +4,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+// use crate::terminal::Terminal;
+
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
@@ -11,6 +13,16 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use mlua::prelude::*;
+
+use crate::project::{Project, ProjectRegistry};
+
+pub struct ExplorerItem {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+    pub children: Vec<ExplorerItem>,
+}
 
 pub struct EditorState {
     pub filename: Option<PathBuf>,
@@ -24,6 +36,12 @@ pub struct EditorState {
     pub redo_stack: Vec<(Vec<String>, usize, usize)>,
     pub is_dirty: bool,
     pub row_off: usize,
+    pub project: Option<Project>,
+    pub is_explorer_visible: bool,
+    pub explorer_items: Vec<ExplorerItem>,
+    pub explorer_selected_index: usize,
+    pub focus_on_explorer: bool,
+    pub recent_files: Vec<PathBuf>,
 }
 
 pub struct Editor {
@@ -32,7 +50,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(filename: Option<PathBuf>) -> io::Result<Self> {
+    pub fn new(filename: Option<PathBuf>, project_root: Option<PathBuf>) -> io::Result<Self> {
         let mut lines = Vec::new();
         if let Some(ref path) = filename {
             if path.exists() {
@@ -44,18 +62,36 @@ impl Editor {
             lines.push(String::new());
         }
 
+        let project = project_root.as_ref().map(|root| {
+            let p = Project::new(root.clone());
+            let registry = ProjectRegistry::new();
+            let _ = registry.remember(p.name.clone(), p.root.clone());
+            p
+        });
+
+        let mut explorer_items = Vec::new();
+        if let Some(ref p) = project {
+            explorer_items = Self::list_dir(&p.root)?;
+        }
+
         let state = Arc::new(Mutex::new(EditorState {
             filename,
             lines,
             cursor_x: 0,
             cursor_y: 0,
-            status_message: String::from("Welcome to Hephaestus! Ctrl+S: save, Ctrl+C: quit"),
+            status_message: String::from("Welcome to heph! Ctrl+S: save, Ctrl+C: quit"),
             key_mappings: HashMap::new(),
             should_quit: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             is_dirty: false,
             row_off: 0,
+            project,
+            is_explorer_visible: project_root.is_some(),
+            explorer_items,
+            explorer_selected_index: 0,
+            focus_on_explorer: false,
+            recent_files: Vec::new(),
         }));
 
         let lua = Lua::new();
@@ -88,24 +124,67 @@ impl Editor {
         let mut s = self.state.lock().unwrap();
         let (cols, rows) = terminal::size()?;
         
+        let editor_height = rows.saturating_sub(1);
+        let mut editor_width = cols;
+        let mut explorer_width = 0;
+
+        if s.is_explorer_visible {
+            explorer_width = 30.min(cols / 3);
+            editor_width = cols.saturating_sub(explorer_width);
+        }
+
         // Adjust row_off to keep cursor visible
         if s.cursor_y < s.row_off {
             s.row_off = s.cursor_y;
         }
-        if s.cursor_y >= s.row_off + (rows - 1) as usize {
-            s.row_off = s.cursor_y - (rows - 1) as usize + 1;
+        if s.cursor_y >= s.row_off + editor_height as usize {
+            s.row_off = s.cursor_y - editor_height as usize + 1;
         }
 
         execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
 
-        // Draw text lines (leave room for status bar)
-        for i in 0..(rows - 1) as usize {
+        // Draw Explorer
+        if s.is_explorer_visible {
+            let mut flat_items = Vec::new();
+            Self::flatten_explorer(&s.explorer_items, 0, &mut flat_items);
+            
+            for i in 0..editor_height as usize {
+                execute!(stdout, cursor::MoveTo(0, i as u16))?;
+                if let Some((item, depth)) = flat_items.get(i) {
+                    let prefix = if item.is_dir {
+                        if item.is_expanded { "[-] " } else { "[+] " }
+                    } else {
+                        "  "
+                    };
+                    let indent = "  ".repeat(*depth);
+                    let line = format!("{}{}{}", indent, prefix, item.name);
+                    let truncated = if line.len() > explorer_width as usize {
+                        &line[..explorer_width as usize]
+                    } else {
+                        &line
+                    };
+                    if s.focus_on_explorer && s.explorer_selected_index == i {
+                        execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse))?;
+                        write!(stdout, "{:<width$}", truncated, width = explorer_width as usize)?;
+                        execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset))?;
+                    } else {
+                        write!(stdout, "{}", truncated)?;
+                    }
+                }
+                // Draw vertical separator
+                execute!(stdout, cursor::MoveTo(explorer_width as u16, i as u16))?;
+                write!(stdout, "│")?;
+            }
+        }
+
+        // Draw text lines
+        for i in 0..editor_height as usize {
             let file_row = i + s.row_off;
             if let Some(line) = s.lines.get(file_row) {
-                execute!(stdout, cursor::MoveTo(0, i as u16))?;
-                // Truncate line if it's longer than screen width
-                let truncated = if line.len() > cols as usize {
-                    &line[..cols as usize]
+                execute!(stdout, cursor::MoveTo(explorer_width + 1, i as u16))?;
+                let available_width = editor_width.saturating_sub(1) as usize;
+                let truncated = if line.len() > available_width {
+                    &line[..available_width]
                 } else {
                     line
                 };
@@ -114,6 +193,7 @@ impl Editor {
         }
 
         // Draw status line
+        execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(1) as u16))?;
         let filename = s.filename.as_deref()
             .and_then(|p| p.to_str())
             .unwrap_or("[No Name]");
@@ -126,16 +206,48 @@ impl Editor {
 
         execute!(
             stdout,
-            cursor::MoveTo(0, rows - 1),
+            cursor::MoveTo(0, rows.saturating_sub(1)),
             terminal::Clear(terminal::ClearType::CurrentLine),
             crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse)
         )?;
         write!(stdout, "{:<width$}", status, width = cols as usize)?;
         execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset))?;
 
-        execute!(stdout, cursor::MoveTo(s.cursor_x as u16, (s.cursor_y - s.row_off) as u16), cursor::Show)?;
+        if s.focus_on_explorer {
+            execute!(stdout, cursor::Hide)?;
+        } else {
+            execute!(stdout, cursor::MoveTo(explorer_width + 1 + s.cursor_x as u16, (s.cursor_y - s.row_off) as u16), cursor::Show)?;
+        }
         stdout.flush()?;
         Ok(())
+    }
+
+    fn flatten_explorer<'a>(items: &'a [ExplorerItem], depth: usize, flat: &mut Vec<(&'a ExplorerItem, usize)>) {
+        for item in items {
+            flat.push((item, depth));
+            if item.is_expanded {
+                Self::flatten_explorer(&item.children, depth + 1, flat);
+            }
+        }
+    }
+
+    pub fn sync_explorer_selection(s: &mut EditorState) {
+        if let Some(ref current_file) = s.filename {
+            let mut flat = Vec::new();
+            Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+            if let Some(index) = flat.iter().position(|(item, _)| {
+                // Try exact match or canonicalized match
+                if item.path == *current_file {
+                    return true;
+                }
+                if let (Ok(p1), Ok(p2)) = (fs::canonicalize(&item.path), fs::canonicalize(current_file)) {
+                    return p1 == p2;
+                }
+                false
+            }) {
+                s.explorer_selected_index = index;
+            }
+        }
     }
 
     fn process_event(&mut self) -> io::Result<()> {
@@ -143,8 +255,8 @@ impl Editor {
             match event::read()? {
                 Event::Key(key) => {
                     let mut s = self.state.lock().unwrap();
-                    
-                    // Handle Lua key mappings
+
+                    // Handle Lua key mappings first, especially Alt-Q
                     let mut key_str = String::new();
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
                         key_str.push_str("C-");
@@ -152,9 +264,13 @@ impl Editor {
                     if key.modifiers.contains(KeyModifiers::ALT) {
                         key_str.push_str("A-");
                     }
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        key_str.push_str("S-");
+                    }
                     match key.code {
-                        KeyCode::Char(c) => key_str.push(c),
-                        _ => {} // Handle other keys if needed
+                        KeyCode::Char(c) => key_str.push(c.to_ascii_lowercase()),
+                        KeyCode::F(n) => key_str.push_str(&format!("F{}", n)),
+                        _ => {}
                     }
                     
                     if !key_str.is_empty() {
@@ -166,6 +282,54 @@ impl Editor {
                             }
                             return Ok(());
                         }
+                    }
+
+                    if s.focus_on_explorer {
+                        match key.code {
+                            KeyCode::Up => {
+                                if s.explorer_selected_index > 0 {
+                                    s.explorer_selected_index -= 1;
+                                }
+                            }
+                            KeyCode::Down => {
+                                let mut flat = Vec::new();
+                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                if s.explorer_selected_index + 1 < flat.len() {
+                                    s.explorer_selected_index += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let mut flat = Vec::new();
+                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                if let Some((item, _)) = flat.get(s.explorer_selected_index) {
+                                    let path = item.path.clone();
+                                    if item.is_dir {
+                                        let path_to_toggle = path.clone();
+                                        Self::toggle_dir_recursive(&mut s.explorer_items, &path_to_toggle)?;
+                                    } else {
+                                        // Open file
+                                        drop(s);
+                                        self.open_file(path)?;
+                                        let mut s = self.state.lock().unwrap();
+                                        s.focus_on_explorer = false;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                let mut flat = Vec::new();
+                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                if let Some((item, _)) = flat.get(s.explorer_selected_index) {
+                                    let path_to_collapse = item.path.clone();
+                                    Self::collapse_dir_recursive(&mut s.explorer_items, &path_to_collapse);
+                                }
+                            }
+                            KeyCode::Esc => {
+                                s.focus_on_explorer = false;
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
                     }
 
                     match key.code {
@@ -332,11 +496,18 @@ impl Editor {
     }
 
     fn save_state(&self, mut s: std::sync::MutexGuard<EditorState>) -> io::Result<()> {
-        if let Some(ref path) = s.filename {
+        if let Some(path) = s.filename.clone() {
             let content = s.lines.join("\n");
-            fs::write(path, content)?;
+            fs::write(&path, content)?;
             s.is_dirty = false;
-            s.status_message = String::from("Saved!");
+            s.status_message = format!("Saved {}", path.display());
+
+            // Add to recent files
+            s.recent_files.retain(|f| f != &path);
+            s.recent_files.insert(0, path);
+            if s.recent_files.len() > 20 {
+                s.recent_files.truncate(20);
+            }
         } else {
             s.status_message = String::from("No filename!");
         }
@@ -373,5 +544,88 @@ impl Editor {
             s.cursor_y = y;
             s.status_message = String::from("Redo");
         }
+    }
+
+    fn open_file(&self, path: PathBuf) -> io::Result<()> {
+        let content = fs::read_to_string(&path)?;
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let mut s = self.state.lock().unwrap();
+        s.filename = Some(path.clone());
+        s.lines = if lines.is_empty() { vec![String::new()] } else { lines };
+        s.cursor_x = 0;
+        s.cursor_y = 0;
+        s.row_off = 0;
+        s.is_dirty = false;
+        s.undo_stack.clear();
+        s.redo_stack.clear();
+        s.status_message = format!("Opened {}", path.display());
+        
+        // Add to recent files
+        s.recent_files.retain(|f| f != &path);
+        s.recent_files.insert(0, path);
+        if s.recent_files.len() > 20 {
+            s.recent_files.truncate(20);
+        }
+        
+        Ok(())
+    }
+
+    fn toggle_dir_recursive(items: &mut Vec<ExplorerItem>, path: &PathBuf) -> io::Result<()> {
+        for item in items {
+            if item.path == *path {
+                item.is_expanded = !item.is_expanded;
+                if item.is_expanded && item.children.is_empty() {
+                    item.children = Self::list_dir(&item.path)?;
+                }
+                return Ok(());
+            }
+            if !item.children.is_empty() {
+                Self::toggle_dir_recursive(&mut item.children, path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collapse_dir_recursive(items: &mut Vec<ExplorerItem>, path: &PathBuf) {
+        for item in items {
+            if item.path == *path {
+                item.is_expanded = false;
+                return;
+            }
+            if !item.children.is_empty() {
+                Self::collapse_dir_recursive(&mut item.children, path);
+            }
+        }
+    }
+
+    fn list_dir(path: &PathBuf) -> io::Result<Vec<ExplorerItem>> {
+        let mut items = Vec::new();
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    let name = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let is_dir = path.is_dir();
+                    items.push(ExplorerItem {
+                        name,
+                        path,
+                        is_dir,
+                        is_expanded: false,
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+        items.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                b.is_dir.cmp(&a.is_dir)
+            } else {
+                a.name.cmp(&b.name)
+            }
+        });
+        Ok(items)
     }
 }
