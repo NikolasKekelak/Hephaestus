@@ -282,6 +282,29 @@ impl Editor {
                                     b: color.b,
                                 };
                             }
+
+                            // Java-specific overrides for class/interface
+                            if ext == "java" {
+                                if let Ok(content) = fs::read_to_string(&item.path) {
+                                    if content.contains("interface ") {
+                                        if let Some(color) = s.theme.file_extension_colors.get("interface") {
+                                            current_fg = crossterm::style::Color::Rgb {
+                                                r: color.r,
+                                                g: color.g,
+                                                b: color.b,
+                                            };
+                                        }
+                                    } else if content.contains("class ") {
+                                        if let Some(color) = s.theme.file_extension_colors.get("class") {
+                                            current_fg = crossterm::style::Color::Rgb {
+                                                r: color.r,
+                                                g: color.g,
+                                                b: color.b,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
