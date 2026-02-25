@@ -1,6 +1,7 @@
 use std::fs;
+use std::collections::HashMap;
 use mlua::prelude::*;
-use crate::editor::Editor;
+use crate::editor::{Editor, Focus, EditorColor};
 
 impl Editor {
     pub fn init_lua(&self) -> LuaResult<()> {
@@ -120,6 +121,75 @@ impl Editor {
         editor_api.set("quit", lua_quit)?;
 
         let state_clone = self.state.clone();
+        let set_theme = self.lua.create_function(move |_, theme_table: LuaTable| {
+            let mut s = state_clone.lock().unwrap();
+            
+            if let Ok(colors) = theme_table.get::<_, LuaTable>("colors") {
+                if let Ok(text) = colors.get::<_, LuaTable>("text") {
+                    s.theme.text_color = EditorColor {
+                        r: text.get("r").unwrap_or(255),
+                        g: text.get("g").unwrap_or(255),
+                        b: text.get("b").unwrap_or(255),
+                    };
+                }
+                if let Ok(bg) = colors.get::<_, LuaTable>("bg") {
+                    s.theme.bg_color = EditorColor {
+                        r: bg.get("r").unwrap_or(0),
+                        g: bg.get("g").unwrap_or(0),
+                        b: bg.get("b").unwrap_or(0),
+                    };
+                }
+                if let Ok(dir) = colors.get::<_, LuaTable>("directory") {
+                    s.theme.directory_color = EditorColor {
+                        r: dir.get("r").unwrap_or(255),
+                        g: dir.get("g").unwrap_or(255),
+                        b: dir.get("b").unwrap_or(255),
+                    };
+                }
+                if let Ok(dot_dir) = colors.get::<_, LuaTable>("dot_directory") {
+                    s.theme.dot_directory_color = EditorColor {
+                        r: dot_dir.get("r").unwrap_or(255),
+                        g: dot_dir.get("g").unwrap_or(255),
+                        b: dot_dir.get("b").unwrap_or(255),
+                    };
+                }
+                if let Ok(file) = colors.get::<_, LuaTable>("file") {
+                    s.theme.file_color = EditorColor {
+                        r: file.get("r").unwrap_or(255),
+                        g: file.get("g").unwrap_or(255),
+                        b: file.get("b").unwrap_or(255),
+                    };
+                }
+                if let Ok(extensions) = colors.get::<_, LuaTable>("extensions") {
+                    let mut ext_colors = HashMap::new();
+                    for pair in extensions.pairs::<String, LuaTable>() {
+                        if let Ok((ext, color_table)) = pair {
+                            let color = EditorColor {
+                                r: color_table.get("r").unwrap_or(255),
+                                g: color_table.get("g").unwrap_or(255),
+                                b: color_table.get("b").unwrap_or(255),
+                            };
+                            ext_colors.insert(ext, color);
+                        }
+                    }
+                    s.theme.file_extension_colors = ext_colors;
+                }
+            }
+            
+            if let Ok(font) = theme_table.get::<_, LuaTable>("font") {
+                if let Ok(name) = font.get::<_, String>("name") {
+                    s.theme.font_name = name;
+                }
+                if let Ok(path) = font.get::<_, String>("path") {
+                    s.theme.font_path = path;
+                }
+            }
+            
+            Ok(())
+        })?;
+        editor_api.set("set_theme", set_theme)?;
+
+        let state_clone = self.state.clone();
         let project_api = self.lua.create_table()?;
         
         let s_clone = state_clone.clone();
@@ -140,10 +210,10 @@ impl Editor {
             let mut s = s_clone.lock().unwrap();
             s.is_explorer_visible = !s.is_explorer_visible;
             if s.is_explorer_visible {
-                s.focus_on_explorer = true;
+                s.focus = Focus::Explorer;
                 Editor::sync_explorer_selection(&mut s);
-            } else {
-                s.focus_on_explorer = false;
+            } else if s.focus == Focus::Explorer {
+                s.focus = Focus::Editor;
             }
             Ok(())
         })?)?;
@@ -151,8 +221,10 @@ impl Editor {
         let s_clone = state_clone.clone();
         explorer_api.set("focus", self.lua.create_function(move |_, (): ()| {
             let mut s = s_clone.lock().unwrap();
-            s.focus_on_explorer = !s.focus_on_explorer;
-            if s.focus_on_explorer {
+            if s.focus == Focus::Explorer {
+                s.focus = Focus::Editor;
+            } else {
+                s.focus = Focus::Explorer;
                 s.is_explorer_visible = true;
                 Editor::sync_explorer_selection(&mut s);
             }
@@ -169,6 +241,40 @@ impl Editor {
         })?)?;
 
         project_api.set("explorer", explorer_api)?;
+
+        let type_api = self.lua.create_table()?;
+        let s_clone_type = state_clone.clone();
+        type_api.set("init", self.lua.create_function(move |_, (p_type, script): (String, String)| {
+            let mut s = s_clone_type.lock().unwrap();
+            s.project_type_inits.insert(p_type, script);
+            Ok(())
+        })?)?;
+        project_api.set("type", type_api)?;
+        
+        project_api.set("create_file", self.lua.create_function(move |_, (rel_path, content): (String, String)| {
+            let s = state_clone.lock().unwrap();
+            if let Some(ref p) = s.project {
+                let full_path = p.root.join(rel_path);
+                if let Some(parent) = full_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(full_path, content);
+            }
+            Ok(())
+        })?)?;
+
+        let state_clone = self.state.clone();
+        project_api.set("file_creation", self.lua.create_function(move |_, templates: HashMap<String, String>| {
+            let mut s = state_clone.lock().unwrap();
+            s.file_templates.extend(templates);
+            Ok(())
+        })?)?;
+
+        let to_upper = self.lua.create_function(|_, s: String| {
+            Ok(s.to_uppercase())
+        })?;
+        globals.set("to_upper", to_upper)?;
+
         editor_api.set("project", project_api)?;
 
         globals.set("editor", editor_api)?;

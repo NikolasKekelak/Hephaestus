@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_yaml;
 use std::fs;
 use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ pub struct ProjectRegistryEntry {
     pub name: String,
     pub root: PathBuf,
     pub last_opened: DateTime<Utc>,
+    pub project_type: Option<String>,
 }
 
 pub struct ProjectRegistry {
@@ -70,7 +72,7 @@ impl ProjectRegistry {
         self.load()
     }
 
-    pub fn remember(&self, name: String, root: PathBuf) -> io::Result<()> {
+    pub fn remember(&self, name: String, root: PathBuf, project_type: Option<String>) -> io::Result<()> {
         let mut entries = self.load()?;
         let abs_root = if root.exists() { fs::canonicalize(root)? } else { root };
         
@@ -78,14 +80,22 @@ impl ProjectRegistry {
             entry.name = name;
             entry.root = abs_root;
             entry.last_opened = Utc::now();
+            if project_type.is_some() {
+                entry.project_type = project_type;
+            }
         } else {
             entries.push(ProjectRegistryEntry {
                 name,
                 root: abs_root,
                 last_opened: Utc::now(),
+                project_type,
             });
         }
         self.save(&entries)
+    }
+
+    pub fn clear(&self) -> io::Result<()> {
+        self.save(&[])
     }
 
     pub fn remove(&self, name: &str) -> io::Result<()> {
@@ -107,14 +117,35 @@ impl ProjectRegistry {
 pub struct Project {
     pub root: PathBuf,
     pub name: String,
+    pub project_type: Option<String>,
 }
 
 impl Project {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, project_type: Option<String>) -> Self {
         let name = root.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed")
             .to_string();
-        Self { root, name }
+        Self { root, name, project_type }
     }
+
+    pub fn write_ember_yaml(&self) -> io::Result<()> {
+        let config = EmberConfig {
+            name: self.name.clone(),
+            project_type: self.project_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            created_at: Utc::now(),
+        };
+        let yaml = serde_yaml::to_string(&config)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(self.root.join("ember.yaml"), yaml)?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EmberConfig {
+    name: String,
+    #[serde(rename = "type")]
+    project_type: String,
+    created_at: DateTime<Utc>,
 }

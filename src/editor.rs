@@ -16,12 +16,38 @@ use mlua::prelude::*;
 
 use crate::project::{Project, ProjectRegistry};
 
+#[derive(Clone)]
 pub struct ExplorerItem {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_expanded: bool,
     pub children: Vec<ExplorerItem>,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Focus {
+    Editor,
+    Explorer,
+    Popup,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EditorColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+pub struct Theme {
+    pub text_color: EditorColor,
+    pub bg_color: EditorColor,
+    pub directory_color: EditorColor,
+    pub dot_directory_color: EditorColor,
+    pub file_color: EditorColor,
+    pub font_name: String,
+    pub font_path: String,
+    pub file_extension_colors: HashMap<String, EditorColor>,
 }
 
 pub struct EditorState {
@@ -40,8 +66,23 @@ pub struct EditorState {
     pub is_explorer_visible: bool,
     pub explorer_items: Vec<ExplorerItem>,
     pub explorer_selected_index: usize,
-    pub focus_on_explorer: bool,
+    pub focus: Focus,
+    pub prev_focus: Focus,
     pub recent_files: Vec<PathBuf>,
+    pub project_type_inits: HashMap<String, String>,
+    pub file_templates: HashMap<String, String>,
+    pub input_mode: InputMode,
+    pub input_buffer: String,
+    pub input_prompt: String,
+    pub menu_selected_index: usize,
+    pub theme: Theme,
+}
+
+#[derive(PartialEq, Clone)]
+pub enum InputMode {
+    Normal,
+    Input,
+    Menu,
 }
 
 pub struct Editor {
@@ -63,15 +104,25 @@ impl Editor {
         }
 
         let project = project_root.as_ref().map(|root| {
-            let p = Project::new(root.clone());
             let registry = ProjectRegistry::new();
-            let _ = registry.remember(p.name.clone(), p.root.clone());
+            let mut project_type = None;
+            if let Ok(Some(entry)) = registry.find_by_name(root.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
+                project_type = entry.project_type;
+            }
+            let p = Project::new(root.clone(), project_type);
+            let _ = registry.remember(p.name.clone(), p.root.clone(), p.project_type.clone());
             p
         });
 
         let mut explorer_items = Vec::new();
         if let Some(ref p) = project {
-            explorer_items = Self::list_dir(&p.root)?;
+            explorer_items = vec![ExplorerItem {
+                name: p.name.clone(),
+                path: p.root.clone(),
+                is_dir: true,
+                is_expanded: true,
+                children: Self::list_dir(&p.root)?,
+            }];
         }
 
         let state = Arc::new(Mutex::new(EditorState {
@@ -90,8 +141,25 @@ impl Editor {
             is_explorer_visible: project_root.is_some(),
             explorer_items,
             explorer_selected_index: 0,
-            focus_on_explorer: false,
+            focus: Focus::Editor,
+            prev_focus: Focus::Editor,
             recent_files: Vec::new(),
+            project_type_inits: HashMap::new(),
+            file_templates: HashMap::new(),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            input_prompt: String::new(),
+            menu_selected_index: 0,
+            theme: Theme {
+                text_color: EditorColor { r: 255, g: 255, b: 255 },
+                bg_color: EditorColor { r: 0, g: 0, b: 0 },
+                directory_color: EditorColor { r: 255, g: 255, b: 255 },
+                dot_directory_color: EditorColor { r: 255, g: 255, b: 255 },
+                file_color: EditorColor { r: 255, g: 255, b: 255 },
+                font_name: String::new(),
+                font_path: String::new(),
+                file_extension_colors: HashMap::new(),
+            },
         }));
 
         let lua = Lua::new();
@@ -101,6 +169,15 @@ impl Editor {
 
     pub fn run(&mut self) -> io::Result<()> {
         self.init_lua().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Initialize project if type is known
+        let project_type = {
+            let s = self.state.lock().unwrap();
+            s.project.as_ref().and_then(|p| p.project_type.clone())
+        };
+        if let Some(p_type) = project_type {
+            let _ = self.init_project(&p_type);
+        }
 
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -141,7 +218,24 @@ impl Editor {
             s.row_off = s.cursor_y - editor_height as usize + 1;
         }
 
-        execute!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        let bg_color = crossterm::style::Color::Rgb {
+            r: s.theme.bg_color.r,
+            g: s.theme.bg_color.g,
+            b: s.theme.bg_color.b,
+        };
+        let fg_color = crossterm::style::Color::Rgb {
+            r: s.theme.text_color.r,
+            g: s.theme.text_color.g,
+            b: s.theme.text_color.b,
+        };
+
+        execute!(
+            stdout,
+            cursor::MoveTo(0, 0),
+            crossterm::style::SetBackgroundColor(bg_color),
+            crossterm::style::SetForegroundColor(fg_color),
+            Clear(ClearType::All)
+        )?;
 
         // Draw Explorer
         if s.is_explorer_visible {
@@ -157,19 +251,57 @@ impl Editor {
                         "  "
                     };
                     let indent = "  ".repeat(*depth);
+                    
+                    let mut current_fg;
+                    if item.is_dir {
+                        let color = if item.name.starts_with('.') {
+                            s.theme.dot_directory_color
+                        } else {
+                            s.theme.directory_color
+                        };
+                        current_fg = crossterm::style::Color::Rgb {
+                            r: color.r,
+                            g: color.g,
+                            b: color.b,
+                        };
+                    } else {
+                        // Default file color
+                        let file_color = s.theme.file_color;
+                        current_fg = crossterm::style::Color::Rgb {
+                            r: file_color.r,
+                            g: file_color.g,
+                            b: file_color.b,
+                        };
+
+                        if let Some(ext) = item.path.extension().and_then(|e| e.to_str()) {
+                            let ext_with_dot = format!(".{}", ext);
+                            if let Some(color) = s.theme.file_extension_colors.get(&ext_with_dot) {
+                                current_fg = crossterm::style::Color::Rgb {
+                                    r: color.r,
+                                    g: color.g,
+                                    b: color.b,
+                                };
+                            }
+                        }
+                    }
+
                     let line = format!("{}{}{}", indent, prefix, item.name);
                     let truncated = if line.len() > explorer_width as usize {
                         &line[..explorer_width as usize]
                     } else {
                         &line
                     };
-                    if s.focus_on_explorer && s.explorer_selected_index == i {
+                    
+                    execute!(stdout, crossterm::style::SetForegroundColor(current_fg))?;
+                    if s.focus == Focus::Explorer && s.explorer_selected_index == i {
                         execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse))?;
                         write!(stdout, "{:<width$}", truncated, width = explorer_width as usize)?;
                         execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset))?;
+                        execute!(stdout, crossterm::style::SetBackgroundColor(bg_color), crossterm::style::SetForegroundColor(fg_color))?;
                     } else {
                         write!(stdout, "{}", truncated)?;
                     }
+                    execute!(stdout, crossterm::style::SetForegroundColor(fg_color))?;
                 }
                 // Draw vertical separator
                 execute!(stdout, cursor::MoveTo(explorer_width as u16, i as u16))?;
@@ -213,11 +345,67 @@ impl Editor {
         write!(stdout, "{:<width$}", status, width = cols as usize)?;
         execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset))?;
 
-        if s.focus_on_explorer {
+        if s.focus == Focus::Explorer {
             execute!(stdout, cursor::Hide)?;
         } else {
             execute!(stdout, cursor::MoveTo(explorer_width + 1 + s.cursor_x as u16, (s.cursor_y - s.row_off) as u16), cursor::Show)?;
         }
+
+        if s.focus == Focus::Popup {
+            let menu_width = 40;
+            let items = if s.input_mode == InputMode::Menu {
+                let mut m = vec!["[File]".to_string(), "[Folder]".to_string()];
+                let mut templates: Vec<String> = s.file_templates.keys().cloned().collect();
+                templates.sort();
+                m.extend(templates);
+                m
+            } else {
+                vec![]
+            };
+
+            let menu_height = if s.input_mode == InputMode::Menu {
+                items.len() + 2
+            } else {
+                3
+            };
+
+            let start_x = (cols.saturating_sub(menu_width)) / 2;
+            let start_y = (rows.saturating_sub(menu_height as u16)) / 2;
+
+            for i in 0..menu_height {
+                execute!(stdout, cursor::MoveTo(start_x, start_y + i as u16))?;
+                write!(stdout, "{:<width$}", " ", width = menu_width as usize)?;
+            }
+
+            execute!(stdout, cursor::MoveTo(start_x, start_y))?;
+            write!(stdout, "┌{:─<width$}┐", "", width = (menu_width - 2) as usize)?;
+            for i in 1..menu_height - 1 {
+                execute!(stdout, cursor::MoveTo(start_x, start_y + i as u16))?;
+                write!(stdout, "│")?;
+                execute!(stdout, cursor::MoveTo(start_x + menu_width - 1, start_y + i as u16))?;
+                write!(stdout, "│")?;
+            }
+            execute!(stdout, cursor::MoveTo(start_x, start_y + menu_height as u16 - 1))?;
+            write!(stdout, "└{:─<width$}┘", "", width = (menu_width - 2) as usize)?;
+
+            if s.input_mode == InputMode::Menu {
+                for (i, item) in items.iter().enumerate() {
+                    execute!(stdout, cursor::MoveTo(start_x + 2, start_y + 1 + i as u16))?;
+                    if s.menu_selected_index == i {
+                        execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse))?;
+                        write!(stdout, "{}", item)?;
+                        execute!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset))?;
+                    } else {
+                        write!(stdout, "{}", item)?;
+                    }
+                }
+            } else {
+                execute!(stdout, cursor::MoveTo(start_x + 2, start_y + 1))?;
+                write!(stdout, "{}: {}", s.input_prompt, s.input_buffer)?;
+                execute!(stdout, cursor::Show, cursor::MoveTo(start_x + 2 + s.input_prompt.len() as u16 + 2 + s.input_buffer.len() as u16, start_y + 1))?;
+            }
+        }
+
         stdout.flush()?;
         Ok(())
     }
@@ -256,7 +444,7 @@ impl Editor {
                 Event::Key(key) => {
                     let mut s = self.state.lock().unwrap();
 
-                    // Handle Lua key mappings first, especially Alt-Q
+                    // 1. Priority: Lua key mappings (can be global)
                     let mut key_str = String::new();
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
                         key_str.push_str("C-");
@@ -284,181 +472,352 @@ impl Editor {
                         }
                     }
 
-                    if s.focus_on_explorer {
-                        match key.code {
-                            KeyCode::Up => {
-                                if s.explorer_selected_index > 0 {
-                                    s.explorer_selected_index -= 1;
+                    // 2. Focus-based event handling
+                    match s.focus {
+                        Focus::Popup => {
+                            if s.input_mode == InputMode::Menu {
+                                match key.code {
+                                    KeyCode::Up => {
+                                        if s.menu_selected_index > 0 {
+                                            s.menu_selected_index -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        let mut templates: Vec<String> = s.file_templates.keys().cloned().collect();
+                                        templates.sort();
+                                        let items_count = 2 + templates.len();
+                                        if s.menu_selected_index + 1 < items_count {
+                                            s.menu_selected_index += 1;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        let index_in_menu = s.menu_selected_index;
+                                        let mut templates: Vec<String> = s.file_templates.keys().cloned().collect();
+                                        templates.sort();
+                                        s.input_buffer.clear();
+                                        if index_in_menu == 0 { // [File]
+                                            s.input_mode = InputMode::Input;
+                                            s.input_prompt = "File Name".to_string();
+                                        } else if index_in_menu == 1 { // [Folder]
+                                            s.input_mode = InputMode::Input;
+                                            s.input_prompt = "Folder Name".to_string();
+                                        } else if index_in_menu - 2 < templates.len() {
+                                            let template_name = templates[index_in_menu - 2].clone();
+                                            s.input_mode = InputMode::Input;
+                                            s.input_prompt = format!("Name for {}", template_name);
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        s.focus = s.prev_focus;
+                                        s.input_mode = InputMode::Normal;
+                                    }
+                                    _ => {}
+                                }
+                            } else if s.input_mode == InputMode::Input {
+                                match key.code {
+                                    KeyCode::Char(c) => {
+                                        s.input_buffer.push(c);
+                                    }
+                                    KeyCode::Backspace => {
+                                        s.input_buffer.pop();
+                                    }
+                                    KeyCode::Enter => {
+                                        let name = s.input_buffer.clone();
+                                        let prompt = s.input_prompt.clone();
+                                        let index_in_menu = s.menu_selected_index;
+                                        let explorer_index = s.explorer_selected_index;
+                                        
+                                        if !name.is_empty() {
+                                            let mut templates: Vec<String> = s.file_templates.keys().cloned().collect();
+                                            templates.sort();
+                                            let project_root = s.project.as_ref().map(|p| p.root.clone());
+                                            
+                                            if let Some(root) = project_root {
+                                                let mut flat = Vec::new();
+                                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                                let target_dir = if let Some((item, _)) = flat.get(explorer_index) {
+                                                    if item.is_dir {
+                                                        item.path.clone()
+                                                    } else {
+                                                        item.path.parent().unwrap_or(&root).to_path_buf()
+                                                    }
+                                                } else {
+                                                    root.clone()
+                                                };
+
+                                                if prompt == "File Name" {
+                                                    let path = target_dir.join(name);
+                                                    let _ = fs::write(&path, "");
+                                                    if let Some(root_item) = s.explorer_items.get_mut(0) {
+                                                        if target_dir == root {
+                                                            if let Ok(new_children) = Self::list_dir(&root) {
+                                                                let mut new_items = Vec::new();
+                                                                for mut new_item in new_children {
+                                                                    if let Some(old_item) = root_item.children.iter().find(|i| i.path == new_item.path) {
+                                                                        new_item.is_expanded = old_item.is_expanded;
+                                                                        if !old_item.children.is_empty() {
+                                                                            new_item.children = old_item.children.clone();
+                                                                        }
+                                                                    }
+                                                                    new_items.push(new_item);
+                                                                }
+                                                                root_item.children = new_items;
+                                                            }
+                                                        } else {
+                                                            Self::refresh_dir_recursive(&mut root_item.children, &target_dir);
+                                                        }
+                                                    }
+                                                } else if prompt == "Folder Name" {
+                                                    let path = target_dir.join(name);
+                                                    let _ = fs::create_dir_all(&path);
+                                                    if let Some(root_item) = s.explorer_items.get_mut(0) {
+                                                        if target_dir == root {
+                                                            if let Ok(new_children) = Self::list_dir(&root) {
+                                                                let mut new_items = Vec::new();
+                                                                for mut new_item in new_children {
+                                                                    if let Some(old_item) = root_item.children.iter().find(|i| i.path == new_item.path) {
+                                                                        new_item.is_expanded = old_item.is_expanded;
+                                                                        if !old_item.children.is_empty() {
+                                                                            new_item.children = old_item.children.clone();
+                                                                        }
+                                                                    }
+                                                                    new_items.push(new_item);
+                                                                }
+                                                                root_item.children = new_items;
+                                                            }
+                                                        } else {
+                                                            Self::refresh_dir_recursive(&mut root_item.children, &target_dir);
+                                                        }
+                                                    }
+                                                } else {
+                                                    let template_name = templates[index_in_menu - 2].clone();
+                                                    if let Some(func_name) = s.file_templates.get(&template_name).cloned() {
+                                                        let rel_target = target_dir.strip_prefix(&root).unwrap_or(std::path::Path::new("")).to_str().unwrap_or("").to_string();
+                                                        let rel_target = if rel_target.is_empty() { String::new() } else { format!("{}/", rel_target) };
+                                                        drop(s);
+                                                        let globals = self.lua.globals();
+                                                        if let Ok(func) = globals.get::<_, LuaFunction>(func_name) {
+                                                            let _ = func.call::<_, ()>((rel_target, name));
+                                                        }
+                                                        let mut s = self.state.lock().unwrap();
+                                                        if let Some(ref mut root_item) = s.explorer_items.get_mut(0) {
+                                                            if target_dir == root {
+                                                                if let Ok(new_children) = Self::list_dir(&root) {
+                                                                    let mut new_items = Vec::new();
+                                                                    for mut new_item in new_children {
+                                                                        if let Some(old_item) = root_item.children.iter().find(|i| i.path == new_item.path) {
+                                                                            new_item.is_expanded = old_item.is_expanded;
+                                                                            if !old_item.children.is_empty() {
+                                                                                new_item.children = old_item.children.clone();
+                                                                            }
+                                                                        }
+                                                                        new_items.push(new_item);
+                                                                    }
+                                                                    root_item.children = new_items;
+                                                                }
+                                                            } else {
+                                                                Self::refresh_dir_recursive(&mut root_item.children, &target_dir);
+                                                            }
+                                                        }
+                                                        s.focus = s.prev_focus;
+                                                        s.input_mode = InputMode::Normal;
+                                                        return Ok(());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        s.focus = s.prev_focus;
+                                        s.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Esc => {
+                                        s.focus = s.prev_focus;
+                                        s.input_mode = InputMode::Normal;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            KeyCode::Down => {
-                                let mut flat = Vec::new();
-                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
-                                if s.explorer_selected_index + 1 < flat.len() {
-                                    s.explorer_selected_index += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                let mut flat = Vec::new();
-                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
-                                if let Some((item, _)) = flat.get(s.explorer_selected_index) {
-                                    let path = item.path.clone();
-                                    if item.is_dir {
-                                        let path_to_toggle = path.clone();
-                                        Self::toggle_dir_recursive(&mut s.explorer_items, &path_to_toggle)?;
-                                    } else {
-                                        // Open file
-                                        drop(s);
-                                        self.open_file(path)?;
-                                        let mut s = self.state.lock().unwrap();
-                                        s.focus_on_explorer = false;
-                                        return Ok(());
+                        }
+                        Focus::Explorer => {
+                            match key.code {
+                                KeyCode::Up => {
+                                    if s.explorer_selected_index > 0 {
+                                        s.explorer_selected_index -= 1;
                                     }
                                 }
-                            }
-                            KeyCode::Backspace => {
-                                let mut flat = Vec::new();
-                                Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
-                                if let Some((item, _)) = flat.get(s.explorer_selected_index) {
-                                    let path_to_collapse = item.path.clone();
-                                    Self::collapse_dir_recursive(&mut s.explorer_items, &path_to_collapse);
+                                KeyCode::Down => {
+                                    let mut flat = Vec::new();
+                                    Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                    if s.explorer_selected_index + 1 < flat.len() {
+                                        s.explorer_selected_index += 1;
+                                    }
                                 }
-                            }
-                            KeyCode::Esc => {
-                                s.focus_on_explorer = false;
-                            }
-                            _ => {}
-                        }
-                        return Ok(());
-                    }
-
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if s.is_dirty {
-                                s.status_message = String::from("Quit? (y: quit, s: save&quit, n: cancel)");
-                                drop(s);
-                                self.draw(&mut io::stdout())?;
-                                loop {
-                                    if event::poll(std::time::Duration::from_millis(100))? {
-                                        if let Event::Key(k) = event::read()? {
+                                KeyCode::Enter => {
+                                    let mut flat = Vec::new();
+                                    Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                    if let Some((item, _)) = flat.get(s.explorer_selected_index) {
+                                        let path = item.path.clone();
+                                        if item.is_dir {
+                                            let path_to_toggle = path.clone();
+                                            Self::toggle_dir_recursive(&mut s.explorer_items, &path_to_toggle)?;
+                                        } else {
+                                            drop(s);
+                                            self.open_file(path)?;
                                             let mut s = self.state.lock().unwrap();
-                                            match k.code {
-                                                KeyCode::Char('y') => {
-                                                    s.should_quit = true;
-                                                    break;
-                                                }
-                                                KeyCode::Char('s') => {
-                                                    self.save_state(s)?;
-                                                    let mut s = self.state.lock().unwrap();
-                                                    s.should_quit = true;
-                                                    break;
-                                                }
-                                                KeyCode::Char('n') | KeyCode::Esc => {
-                                                    s.status_message = String::from("Canceled quit");
-                                                    break;
-                                                }
-                                                _ => {}
-                                            }
+                                            s.focus = Focus::Editor;
                                         }
                                     }
                                 }
-                            } else {
-                                s.should_quit = true;
+                                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if s.is_explorer_visible {
+                                        s.prev_focus = Focus::Explorer;
+                                        s.focus = Focus::Popup;
+                                        s.input_mode = InputMode::Menu;
+                                        s.menu_selected_index = 0;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    let mut flat = Vec::new();
+                                    Self::flatten_explorer(&s.explorer_items, 0, &mut flat);
+                                    if let Some((item, _)) = flat.get(s.explorer_selected_index) {
+                                        let path_to_collapse = item.path.clone();
+                                        Self::collapse_dir_recursive(&mut s.explorer_items, &path_to_collapse);
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    s.focus = Focus::Editor;
+                                }
+                                _ => {}
                             }
                         }
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.save_state(s)?;
-                        }
-                        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.undo(&mut s);
-                        }
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.redo(&mut s);
-                        }
-                        KeyCode::Up => {
-                            if s.cursor_y > 0 {
-                                s.cursor_y -= 1;
-                                s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
+                        Focus::Editor => {
+                            match key.code {
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if s.is_dirty {
+                                        s.status_message = String::from("Quit? (y: quit, s: save&quit, n: cancel)");
+                                        drop(s);
+                                        self.draw(&mut io::stdout())?;
+                                        loop {
+                                            if event::poll(std::time::Duration::from_millis(100))? {
+                                                if let Event::Key(k) = event::read()? {
+                                                    let mut s = self.state.lock().unwrap();
+                                                    match k.code {
+                                                        KeyCode::Char('y') => {
+                                                            s.should_quit = true;
+                                                            break;
+                                                        }
+                                                        KeyCode::Char('s') => {
+                                                            self.save_state(s)?;
+                                                            let mut s = self.state.lock().unwrap();
+                                                            s.should_quit = true;
+                                                            break;
+                                                        }
+                                                        KeyCode::Char('n') | KeyCode::Esc => {
+                                                            s.status_message = String::from("Canceled quit");
+                                                            break;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        s.should_quit = true;
+                                    }
+                                }
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    self.save_state(s)?;
+                                }
+                                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    self.undo(&mut s);
+                                }
+                                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    self.redo(&mut s);
+                                }
+                                KeyCode::Up => {
+                                    if s.cursor_y > 0 {
+                                        s.cursor_y -= 1;
+                                        s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if s.cursor_y < s.lines.len() - 1 {
+                                        s.cursor_y += 1;
+                                        s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
+                                    }
+                                }
+                                KeyCode::PageUp => {
+                                    let (_, rows) = terminal::size()?;
+                                    let rows = (rows - 1) as usize;
+                                    if s.cursor_y > rows {
+                                        s.cursor_y -= rows;
+                                    } else {
+                                        s.cursor_y = 0;
+                                    }
+                                    s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
+                                }
+                                KeyCode::PageDown => {
+                                    let (_, rows) = terminal::size()?;
+                                    let rows = (rows - 1) as usize;
+                                    s.cursor_y += rows;
+                                    if s.cursor_y >= s.lines.len() {
+                                        s.cursor_y = s.lines.len() - 1;
+                                    }
+                                    s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
+                                }
+                                KeyCode::Left => {
+                                    if s.cursor_x > 0 {
+                                        s.cursor_x -= 1;
+                                    } else if s.cursor_y > 0 {
+                                        s.cursor_y -= 1;
+                                        s.cursor_x = s.lines[s.cursor_y].len();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if s.cursor_x < s.lines[s.cursor_y].len() {
+                                        s.cursor_x += 1;
+                                    } else if s.cursor_y < s.lines.len() - 1 {
+                                        s.cursor_y += 1;
+                                        s.cursor_x = 0;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    self.push_undo(&mut s);
+                                    let y = s.cursor_y;
+                                    let x = s.cursor_x;
+                                    s.lines[y].insert(x, c);
+                                    s.cursor_x += 1;
+                                }
+                                KeyCode::Enter => {
+                                    self.push_undo(&mut s);
+                                    let y = s.cursor_y;
+                                    let x = s.cursor_x;
+                                    let new_line = s.lines[y].split_off(x);
+                                    s.lines.insert(y + 1, new_line);
+                                    s.cursor_y += 1;
+                                    s.cursor_x = 0;
+                                }
+                                KeyCode::Backspace => {
+                                    let y = s.cursor_y;
+                                    let x = s.cursor_x;
+                                    if x > 0 || y > 0 {
+                                        self.push_undo(&mut s);
+                                    }
+                                    let y = s.cursor_y;
+                                    let x = s.cursor_x;
+                                    if x > 0 {
+                                        s.lines[y].remove(x - 1);
+                                        s.cursor_x -= 1;
+                                    } else if y > 0 {
+                                        let current_line = s.lines.remove(y);
+                                        s.cursor_y -= 1;
+                                        let prev_y = s.cursor_y;
+                                        s.cursor_x = s.lines[prev_y].len();
+                                        s.lines[prev_y].push_str(&current_line);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        KeyCode::Down => {
-                            if s.cursor_y < s.lines.len() - 1 {
-                                s.cursor_y += 1;
-                                s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            let (_, rows) = terminal::size()?;
-                            let rows = (rows - 1) as usize;
-                            if s.cursor_y > rows {
-                                s.cursor_y -= rows;
-                            } else {
-                                s.cursor_y = 0;
-                            }
-                            s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
-                        }
-                        KeyCode::PageDown => {
-                            let (_, rows) = terminal::size()?;
-                            let rows = (rows - 1) as usize;
-                            s.cursor_y += rows;
-                            if s.cursor_y >= s.lines.len() {
-                                s.cursor_y = s.lines.len() - 1;
-                            }
-                            s.cursor_x = s.cursor_x.min(s.lines[s.cursor_y].len());
-                        }
-                        KeyCode::Left => {
-                            if s.cursor_x > 0 {
-                                s.cursor_x -= 1;
-                            } else if s.cursor_y > 0 {
-                                s.cursor_y -= 1;
-                                s.cursor_x = s.lines[s.cursor_y].len();
-                            }
-                        }
-                        KeyCode::Right => {
-                            if s.cursor_x < s.lines[s.cursor_y].len() {
-                                s.cursor_x += 1;
-                            } else if s.cursor_y < s.lines.len() - 1 {
-                                s.cursor_y += 1;
-                                s.cursor_x = 0;
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            self.push_undo(&mut s);
-                            let y = s.cursor_y;
-                            let x = s.cursor_x;
-                            s.lines[y].insert(x, c);
-                            s.cursor_x += 1;
-                        }
-                        KeyCode::Enter => {
-                            self.push_undo(&mut s);
-                            let y = s.cursor_y;
-                            let x = s.cursor_x;
-                            let new_line = s.lines[y].split_off(x);
-                            s.lines.insert(y + 1, new_line);
-                            s.cursor_y += 1;
-                            s.cursor_x = 0;
-                        }
-                        KeyCode::Backspace => {
-                            let y = s.cursor_y;
-                            let x = s.cursor_x;
-                            if x > 0 || y > 0 {
-                                self.push_undo(&mut s);
-                            }
-                            
-                            let y = s.cursor_y;
-                            let x = s.cursor_x;
-                            if x > 0 {
-                                s.lines[y].remove(x - 1);
-                                s.cursor_x -= 1;
-                            } else if y > 0 {
-                                let current_line = s.lines.remove(y);
-                                s.cursor_y -= 1;
-                                let prev_y = s.cursor_y;
-                                s.cursor_x = s.lines[prev_y].len();
-                                s.lines[prev_y].push_str(&current_line);
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 Event::Mouse(mouse_event) => {
@@ -627,5 +986,73 @@ impl Editor {
             }
         });
         Ok(items)
+    }
+
+    fn refresh_dir_recursive(items: &mut Vec<ExplorerItem>, path: &PathBuf) -> bool {
+        for item in items {
+            if item.path == *path {
+                if let Ok(new_children) = Self::list_dir(&item.path) {
+                    // Merge new children with existing ones to preserve expansion state
+                    let mut new_items = Vec::new();
+                    for mut new_item in new_children {
+                        if let Some(old_item) = item.children.iter().find(|i| i.path == new_item.path) {
+                            new_item.is_expanded = old_item.is_expanded;
+                            if !old_item.children.is_empty() {
+                                new_item.children = old_item.children.clone();
+                            }
+                        }
+                        new_items.push(new_item);
+                    }
+                    item.children = new_items;
+                    item.is_expanded = true; // Ensure it's expanded so user sees the new item
+                    return true;
+                }
+            }
+            if !item.children.is_empty() {
+                if Self::refresh_dir_recursive(&mut item.children, path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn init_project(&mut self, project_type: &str) -> io::Result<bool> {
+        let script_name = {
+            let s = self.state.lock().unwrap();
+            s.project_type_inits.get(project_type).cloned()
+        };
+
+        let script_name = match script_name {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        if !std::path::Path::new(&script_name).exists() {
+            return Ok(false);
+        }
+
+        let lua_code = fs::read_to_string(&script_name)?;
+        self.lua.load(&lua_code).exec().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        // Refresh explorer after init
+        let mut s = self.state.lock().unwrap();
+        if let Some(ref mut p) = s.project {
+            p.project_type = Some(project_type.to_string());
+            let registry = ProjectRegistry::new();
+            let _ = registry.remember(p.name.clone(), p.root.clone(), p.project_type.clone());
+            
+            if let Ok(items) = Self::list_dir(&p.root) {
+                s.explorer_items = vec![ExplorerItem {
+                    name: p.name.clone(),
+                    path: p.root.clone(),
+                    is_dir: true,
+                    is_expanded: true,
+                    children: items,
+                }];
+            }
+        }
+        
+        Ok(true)
     }
 }
