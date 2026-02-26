@@ -68,6 +68,12 @@ impl ProjectRegistry {
         Ok(entries.into_iter().find(|e| e.name == name))
     }
 
+    pub fn find_by_path(&self, path: &Path) -> io::Result<Option<ProjectRegistryEntry>> {
+        let entries = self.load()?;
+        let abs_path = if path.exists() { fs::canonicalize(path)? } else { path.to_path_buf() };
+        Ok(entries.into_iter().find(|e| e.root == abs_path))
+    }
+
     pub fn list(&self) -> io::Result<Vec<ProjectRegistryEntry>> {
         self.load()
     }
@@ -118,6 +124,7 @@ pub struct Project {
     pub root: PathBuf,
     pub name: String,
     pub project_type: Option<String>,
+    pub description: Option<String>,
 }
 
 impl Project {
@@ -126,26 +133,85 @@ impl Project {
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed")
             .to_string();
-        Self { root, name, project_type }
+        Self { root, name, project_type, description: None }
     }
 
-    pub fn write_ember_yaml(&self) -> io::Result<()> {
+    pub fn load_ember_yaml(root: &Path) -> io::Result<EmberConfig> {
+        let mut path = root.join(".anvil").join("ember.yaml");
+        if !path.exists() {
+            // Fallback to legacy location
+            path = root.join("ember.yaml");
+        }
+        let content = fs::read_to_string(path)?;
+        let config: EmberConfig = serde_yaml::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(config)
+    }
+
+    pub fn write_anvil(&self) -> io::Result<()> {
+        let anvil_dir = self.root.join(".anvil");
+        fs::create_dir_all(&anvil_dir)?;
+
         let config = EmberConfig {
             name: self.name.clone(),
             project_type: self.project_type.clone().unwrap_or_else(|| "unknown".to_string()),
             created_at: Utc::now(),
+            description: self.description.clone(),
         };
         let yaml = serde_yaml::to_string(&config)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        fs::write(self.root.join("ember.yaml"), yaml)?;
+        fs::write(anvil_dir.join("ember.yaml"), yaml)?;
+
+        // Create an empty project-specific Lua script if it doesn't exist
+        let lua_script = anvil_dir.join("project.lua");
+        if !lua_script.exists() {
+            fs::write(lua_script, "-- Project specific Lua scripts\n")?;
+        }
+
         Ok(())
+    }
+
+    pub fn save_session(&self, session: &ProjectSession) -> io::Result<()> {
+        let anvil_dir = self.root.join(".anvil");
+        fs::create_dir_all(&anvil_dir)?;
+        let path = anvil_dir.join("session.json");
+        let content = serde_json::to_string_pretty(session)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn load_session(&self) -> io::Result<Option<ProjectSession>> {
+        let path = self.root.join(".anvil").join("session.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path)?;
+        let session: ProjectSession = serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(Some(session))
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionTab {
+    pub path: PathBuf,
+    pub cursor_x: usize,
+    pub cursor_y: usize,
+    pub row_off: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectSession {
+    pub open_tabs: Vec<SessionTab>,
+    pub current_tab_index: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
-struct EmberConfig {
-    name: String,
+pub struct EmberConfig {
+    pub name: String,
     #[serde(rename = "type")]
-    project_type: String,
-    created_at: DateTime<Utc>,
+    pub project_type: String,
+    pub created_at: DateTime<Utc>,
+    pub description: Option<String>,
 }

@@ -1,45 +1,50 @@
 use std::fs;
 use std::collections::HashMap;
 use mlua::prelude::*;
-use crate::editor::{Editor, Focus, EditorColor};
+use crate::editor::{Editor, Focus, EditorColor, InputMode};
 
 impl Editor {
     pub fn init_lua(&self) -> LuaResult<()> {
         let state = self.state.clone();
         let get_cursor = self.lua.create_function(move |_, (): ()| {
             let s = state.lock().unwrap();
-            Ok((s.cursor_x, s.cursor_y))
+            let tab = &s.tabs[s.current_tab_index];
+            Ok((tab.cursor_x, tab.cursor_y))
         })?;
 
         let state_clone = self.state.clone();
         let set_cursor = self.lua.create_function(move |_, (x, y): (usize, usize)| {
             let mut s = state_clone.lock().unwrap();
-            if s.lines.is_empty() {
-                s.lines.push(String::new());
+            let index = s.current_tab_index;
+            let tab = &mut s.tabs[index];
+            if tab.lines.is_empty() {
+                tab.lines.push(String::new());
             }
-            s.cursor_y = y.min(s.lines.len() - 1);
-            let y = s.cursor_y;
-            s.cursor_x = x.min(s.lines[y].len());
+            tab.cursor_y = y.min(tab.lines.len() - 1);
+            let y = tab.cursor_y;
+            tab.cursor_x = x.min(tab.lines[y].len());
             Ok(())
         })?;
 
         let state_clone = self.state.clone();
         let insert_text = self.lua.create_function(move |_, text: String| {
             let mut s = state_clone.lock().unwrap();
-            if s.lines.is_empty() {
-                s.lines.push(String::new());
+            let current_tab_index = s.current_tab_index;
+            let tab = &mut s.tabs[current_tab_index];
+            if tab.lines.is_empty() {
+                tab.lines.push(String::new());
             }
             for c in text.chars() {
-                let y = s.cursor_y;
-                let x = s.cursor_x;
+                let y = tab.cursor_y;
+                let x = tab.cursor_x;
                 if c == '\n' {
-                    let new_line = s.lines[y].split_off(x);
-                    s.lines.insert(y + 1, new_line);
-                    s.cursor_y += 1;
-                    s.cursor_x = 0;
+                    let new_line = tab.lines[y].split_off(x);
+                    tab.lines.insert(y + 1, new_line);
+                    tab.cursor_y += 1;
+                    tab.cursor_x = 0;
                 } else {
-                    s.lines[y].insert(x, c);
-                    s.cursor_x += 1;
+                    tab.lines[y].insert(x, c);
+                    tab.cursor_x += 1;
                 }
             }
             Ok(())
@@ -70,12 +75,14 @@ impl Editor {
         let state_clone = self.state.clone();
         let lua_undo = self.lua.create_function(move |_, (): ()| {
             let mut s = state_clone.lock().unwrap();
-            if let Some((lines, x, y)) = s.undo_stack.pop() {
-                let current_state = (s.lines.clone(), s.cursor_x, s.cursor_y);
-                s.redo_stack.push(current_state);
-                s.lines = lines;
-                s.cursor_x = x;
-                s.cursor_y = y;
+            let current_tab_index = s.current_tab_index;
+            let tab = &mut s.tabs[current_tab_index];
+            if let Some((lines, x, y)) = tab.undo_stack.pop() {
+                let current_state = (tab.lines.clone(), tab.cursor_x, tab.cursor_y);
+                tab.redo_stack.push(current_state);
+                tab.lines = lines;
+                tab.cursor_x = x;
+                tab.cursor_y = y;
                 s.status_message = String::from("Undo");
             }
             Ok(())
@@ -85,12 +92,14 @@ impl Editor {
         let state_clone = self.state.clone();
         let lua_redo = self.lua.create_function(move |_, (): ()| {
             let mut s = state_clone.lock().unwrap();
-            if let Some((lines, x, y)) = s.redo_stack.pop() {
-                let current_state = (s.lines.clone(), s.cursor_x, s.cursor_y);
-                s.undo_stack.push(current_state);
-                s.lines = lines;
-                s.cursor_x = x;
-                s.cursor_y = y;
+            let current_tab_index = s.current_tab_index;
+            let tab = &mut s.tabs[current_tab_index];
+            if let Some((lines, x, y)) = tab.redo_stack.pop() {
+                let current_state = (tab.lines.clone(), tab.cursor_x, tab.cursor_y);
+                tab.undo_stack.push(current_state);
+                tab.lines = lines;
+                tab.cursor_x = x;
+                tab.cursor_y = y;
                 s.status_message = String::from("Redo");
             }
             Ok(())
@@ -100,10 +109,12 @@ impl Editor {
         let state_clone = self.state.clone();
         let lua_save = self.lua.create_function(move |_, (): ()| {
             let mut s = state_clone.lock().unwrap();
-            if let Some(ref path) = s.filename {
-                let content = s.lines.join("\n");
+            let current_tab_index = s.current_tab_index;
+            let tab = &mut s.tabs[current_tab_index];
+            if let Some(ref path) = tab.filename {
+                let content = tab.lines.join("\n");
                 let _ = fs::write(path, content);
-                s.is_dirty = false;
+                tab.is_dirty = false;
                 s.status_message = String::from("Saved!");
             } else {
                 s.status_message = String::from("No filename!");
@@ -232,6 +243,19 @@ impl Editor {
         })?)?;
 
         let s_clone = state_clone.clone();
+        explorer_api.set("open_context_menu", self.lua.create_function(move |_, (): ()| {
+            let mut s = s_clone.lock().unwrap();
+            if s.is_explorer_visible && s.focus == Focus::Explorer {
+                s.prev_focus = s.focus;
+                s.focus = Focus::Popup;
+                s.input_mode = InputMode::ContextMenu;
+                s.menu_selected_index = 0;
+                s.menu_items = vec!["Rename".to_string(), "Delete".to_string()];
+            }
+            Ok(())
+        })?)?;
+
+        let s_clone = state_clone.clone();
         editor_api.set("get_recent_files", self.lua.create_function(move |_, (): ()| {
             let s = s_clone.lock().unwrap();
             let recent: Vec<String> = s.recent_files.iter()
@@ -247,6 +271,14 @@ impl Editor {
         type_api.set("init", self.lua.create_function(move |_, (p_type, script): (String, String)| {
             let mut s = s_clone_type.lock().unwrap();
             s.project_type_inits.insert(p_type, script);
+            Ok(())
+        })?)?;
+
+        type_api.set("init_folder", self.lua.create_function(move |lua, (folder, main_script): (String, String)| {
+            let path = std::path::Path::new(&folder).join(&main_script);
+            if let Ok(content) = fs::read_to_string(&path) {
+                let _ = lua.load(&content).exec();
+            }
             Ok(())
         })?)?;
         project_api.set("type", type_api)?;
