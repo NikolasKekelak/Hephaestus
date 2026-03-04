@@ -7,35 +7,40 @@ use std::io;
 use std::path::PathBuf;
 use crate::editor::Editor;
 use crate::project::{ProjectRegistry, Project};
+use colored::Colorize;
 
 fn print_help() {
-    println!("heph - A simple text editor");
+    println!("{}","HEPHAESTOS".red().bold());
     println!();
-    println!("Usage:");
-    println!("   [filename]        Open a file for editing");
-    println!("   -p , --project <name>            Open a project");
-    println!("   -p , --project new <name> [type] Create a new project in current folder with optional type");
-    println!("   -p , --project menu              Open project selection menu");
-    println!("   -p , --project list [clear]      List all projects or clear the registry");
-    println!("   -p , --project rem <name>        Remove project from registry");
-    println!("   -h , --help                      Show this help message");
-    println!("   -v , --version                   Show version");
-    println!("   -typeh [type]                    Show help for a specific project type");
+    println!("{}", "Usage:".green().bold());
+    println!("   {}                       Open a file for editing", "[filename]".red());
+    println!("   {} {}           {}","-p , --project ".cyan(),"<name>".red(),"Open a project");
+    println!("   {} {} {}","-p , --project new".cyan(),"<name> [type]".red(),"Create a new project in current folder with optional type");
+    println!("   {}              {}","-p , --project menu".cyan(),"Open project selection menu");
+    println!("   -p , --project list [clear]      {}","List all projects or clear the registry");
+    println!("   -p , --project rem <name>        {}","Remove project from registry");
+    println!("   {}                      {}","-h , --help".cyan(),"Show this help message");
+    println!("   {}                   {}", "-v , --version".cyan(),"Show version");
+    println!("   {} {}              {} ","-t , --typeh".cyan(),"<type>".red() ,"Show help for a specific project type");
     println!();
-    println!("Parameters called when -p | --project new/add is used before");
-    println!("   -type [type]                     Declares project type, based on .lua scripts in /scripts/pinits/pinits.lua ,");
+    println!();
+    println!();
+    println!( "{}","Parameters called when -p | --project new/add is used before".green().bold() );
+    println!("   {} {}                     {}", "-type".cyan(),"[type]".red(), "Declares project type, based on .lua scripts in /scripts/pinits/pinits.lua ,");
     println!("                                    default (pre-defined) project types are: C++, C, Java, Python, Rust.");
     println!("                                    If no type is provided, the project will be created but with type Unknown.");
-    println!("   -param [[param1],...,[param2]]   Inicialize project types outside default project settings (more to learn using -typeh)                             ");
-    println!("   -git                             Creates fresh github repository together with the project.");
-    println!("   -git-clone [url]                 Clone git repository into current folder and creates project.");
+    println!("   {} {}   {}", "-param".cyan(), "<[param1],...,[param2]>".red(), "Inicialize project types outside default project settings (more to learn using --typeh or -t)");
+    println!("   {}                             {}","-git".cyan(), "With project initialization, also git repository is created");
+    println!("   {} {}                 {}", "-git-clone".cyan(), "<url>".red(), "Clone git repository into current folder and creates project.");
     println!();
-    println!("Controls:");
-    println!("  Ctrl+S    Save");
-    println!("  Ctrl+C    Quit ");
-    println!("  Ctrl+Z    Undo");
-    println!("  Ctrl+Y    Redo");
-    println!("  Arrows    Navigate");
+    println!();
+    println!("{}","Controls:".green().bold());
+    println!("{} ", "TO BE ADDED AS IT IS CURRENTLY IN DEVELOPMENT".yellow());
+
+}
+
+fn typeh(type_name: &str) {
+
 }
 
 fn handle_project_new(args: &[String], i: &mut usize, registry: &ProjectRegistry) -> io::Result<PathBuf> {
@@ -133,7 +138,6 @@ fn handle_project_remove(args: &[String], i: usize, registry: &ProjectRegistry) 
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_help();
         return Ok(());
@@ -143,7 +147,10 @@ fn main() -> io::Result<()> {
     let mut project_root = None;
 
     let mut i = 1;
-    while i < args.len() {
+
+    if args.len() == 1 {
+        println!("Hephaestos cannot be currently run on its own, consider using -h , --help for more info");
+    } else { while i < args.len() {
         let arg = &args[i];
         if arg == "-p" || arg == "--project" {
             if i + 1 < args.len() {
@@ -178,7 +185,12 @@ fn main() -> io::Result<()> {
             }
         } else if arg == "-h" || arg == "--help" {
             i += 1;
-        } else {
+
+        } else if arg == "-v" || arg == "--version" {
+            println!("Hephaestos - experimental version 0.1.1");
+            i += 1;
+            return Ok(());
+        }else {
             let path = PathBuf::from(arg);
             if path.exists() {
                 filename = Some(path);
@@ -188,7 +200,7 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             }
         }
-    }
+    }}
 
     let mut editor = Editor::new(filename, project_root)?;
     editor.run()

@@ -59,7 +59,7 @@ editor.set_theme({
         path = "/usr/share/fonts/TTF/FiraCode-Regular.ttf"
     }
 })
-2
+
 
 --Project types
 editor.project.type.init_folder("scripts/pinits", "pinits.lua")

@@ -312,7 +312,7 @@ impl Editor {
         globals.set("editor", editor_api)?;
 
         if fs::metadata("init.lua").is_ok() {
-            self.lua.load(fs::read_to_string("init.lua")?).exec()?;
+            self.lua.load(fs::read_to_string("./init.lua")?).exec()?;
         }
 
         Ok(())
