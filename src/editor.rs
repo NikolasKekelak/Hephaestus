@@ -1306,16 +1306,42 @@ impl Editor {
                                     let x = tab.cursor_x;
                                     tab.lines[y].insert(x, c);
                                     tab.cursor_x += 1;
+                                    tab.is_dirty = true;
+                                }
+                                KeyCode::Tab => {
+                                    self.push_undo(&mut s);
+                                    let tab = &mut s.tabs[current_tab_index];
+                                    let y = tab.cursor_y;
+                                    let x = tab.cursor_x;
+                                    tab.lines[y].insert_str(x, "    ");
+                                    tab.cursor_x += 4;
+                                    tab.is_dirty = true;
                                 }
                                 KeyCode::Enter => {
                                     self.push_undo(&mut s);
                                     let tab = &mut s.tabs[current_tab_index];
                                     let y = tab.cursor_y;
                                     let x = tab.cursor_x;
-                                    let new_line = tab.lines[y].split_off(x);
+
+                                    // Get leading whitespace of the current line
+                                    let current_line = &tab.lines[y];
+                                    let mut whitespace = String::new();
+                                    for c in current_line.chars() {
+                                        if c.is_whitespace() && c != '\n' && c != '\r' {
+                                            whitespace.push(c);
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    let mut new_line = tab.lines[y].split_off(x);
+                                    let whitespace_len = whitespace.len();
+                                    new_line.insert_str(0, &whitespace);
+
                                     tab.lines.insert(y + 1, new_line);
                                     tab.cursor_y += 1;
-                                    tab.cursor_x = 0;
+                                    tab.cursor_x = whitespace_len;
+                                    tab.is_dirty = true;
                                 }
                                 KeyCode::Backspace => {
                                     let tab = &mut s.tabs[current_tab_index];
@@ -1330,12 +1356,14 @@ impl Editor {
                                     if x > 0 {
                                         tab.lines[y].remove(x - 1);
                                         tab.cursor_x -= 1;
+                                        tab.is_dirty = true;
                                     } else if y > 0 {
                                         let current_line = tab.lines.remove(y);
                                         tab.cursor_y -= 1;
                                         let prev_y = tab.cursor_y;
                                         tab.cursor_x = tab.lines[prev_y].len();
                                         tab.lines[prev_y].push_str(&current_line);
+                                        tab.is_dirty = true;
                                     }
                                 }
                                 _ => {}
